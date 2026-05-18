@@ -1,0 +1,5 @@
+# Claude Code settings (local only)
+.claude/settings.local.json
+
+# Chrome extension generated files
+_metadata/

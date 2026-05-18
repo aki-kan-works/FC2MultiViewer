@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "NicoMultiViewer2",
+  "version": "0.1.0",
+  "description": "ニコニコ生放送を同一タブ内で複数同時視聴（canvas方式）",
+  "permissions": ["storage", "declarativeNetRequest", "tabs"],
+  "host_permissions": ["https://*.nicovideo.jp/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+     "64": "images/icon.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://live.nicovideo.jp/watch/*",
+        "https://live2.nicovideo.jp/watch/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://live.nicovideo.jp/watch/*",
+        "https://live2.nicovideo.jp/watch/*"
+      ],
+      "js": ["frame-content.js"],
+      "all_frames": true,
+      "match_about_blank": false,
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["frame-patch.js"],
+      "matches": ["https://*.nicovideo.jp/*"]
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
+}
