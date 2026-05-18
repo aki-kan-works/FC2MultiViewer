@@ -145,6 +145,16 @@
   let _extMuting = false; // extension によるミュート変更中フラグ（再入防止）
   let _userMuted = false; // プロモートサブのミュート意図（キャンバス上のボタンで制御）
 
+  // サブiframeのAudioContextゲインをpostMessage経由で制御する。
+  // frame-content.js がメッセージを受け取り、CustomEventでframe-patch.jsへ中継する。
+  function sendSubFrameMute(url, muted) {
+    const d = subData.get(url);
+    if (!d?.iframe?.contentWindow) return;
+    try {
+      d.iframe.contentWindow.postMessage({ type: 'nmv2-mute', muted: !!muted }, '*');
+    } catch (_) {}
+  }
+
   // 各放送（URL）ごとの独立音量。スワップ後の初期値はメイン video に揃え、
   // 以後はスライダーで個別に変更可。「移動」遷移時に transfer 経由で引き継ぐ。
   const urlVolumes = new Map();           // URL → 音量(0..1)
@@ -186,19 +196,35 @@
     }
   }
 
+  // ネストされた iframe も含めて doc 内の全 audio/video に muted を適用する。
+  // syncAudio / applyUserMuted の両方から呼ばれる共通ヘルパー。
+  function _applyMuteToDoc(doc, wantMuted) {
+    try {
+      doc.querySelectorAll('video, audio').forEach(el => {
+        if (el.muted !== wantMuted) el.muted = wantMuted;
+      });
+      doc.querySelectorAll('iframe').forEach(f => {
+        try {
+          if (f.contentDocument) _applyMuteToDoc(f.contentDocument, wantMuted);
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
   function applyUserMuted() {
     const d = subData.get(mainSrc);
     if (!d) return;
-    // S17: d.videoEl キャッシュを利用、audio のみ querySelectorAll
+    // S17: d.videoEl キャッシュを利用
     if (d.videoEl && d.videoEl.isConnected) {
       try { d.videoEl.muted = _userMuted; } catch (_) {}
     }
     if (!d.iframe) return;
     try {
-      d.iframe.contentDocument?.querySelectorAll('audio').forEach(el => {
-        el.muted = _userMuted;
-      });
+      const doc = d.iframe.contentDocument;
+      if (doc) _applyMuteToDoc(doc, _userMuted);
     } catch (_) {}
+    // AudioContext (Web Audio API) ゲインも制御
+    sendSubFrameMute(mainSrc, _userMuted);
   }
 
   function ensureVolumeListener() {
@@ -240,10 +266,12 @@
           if (d.videoEl.muted !== wantMuted) d.videoEl.muted = wantMuted;
         }
         try {
-          d.iframe.contentDocument?.querySelectorAll('audio').forEach(el => {
-            if (el.muted !== wantMuted) el.muted = wantMuted;
-          });
+          const doc = d.iframe.contentDocument;
+          // ネストされた iframe（ギフト・ゲーム音）も含めて再帰的に適用
+          if (doc) _applyMuteToDoc(doc, wantMuted);
         } catch (_) {}
+        // AudioContext (Web Audio API) ゲインを postMessage 経由で制御
+        sendSubFrameMute(url, wantMuted);
       }
     } finally {
       _extMuting = false;
@@ -291,6 +319,47 @@
     } catch (_) {}
   }
 
+  // ギフト・ゲーム音はサブiframe内のネストされたiframeで再生される場合がある。
+  // そのdocumentも再帰的に監視してミュートポリシーを適用する。
+  function _trackSubIframe(url, iframeEl) {
+    if (iframeEl._nmv2IframeTracked) return;
+    iframeEl._nmv2IframeTracked = true;
+
+    const scan = () => {
+      try {
+        const doc = iframeEl.contentDocument;
+        if (!doc || !doc.documentElement) return;
+        doc.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
+        doc.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
+        const mo = new MutationObserver((records) => {
+          for (const r of records) {
+            for (const n of r.addedNodes) {
+              if (!n || n.nodeType !== 1) continue;
+              const tag = n.tagName;
+              if (tag === 'VIDEO' || tag === 'AUDIO') {
+                _trackSubAudioEl(url, n);
+              } else if (tag === 'IFRAME') {
+                _trackSubIframe(url, n);
+              } else if (n.querySelectorAll) {
+                n.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
+                n.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
+              }
+            }
+          }
+        });
+        mo.observe(doc.documentElement, { childList: true, subtree: true });
+        const d = subData.get(url);
+        if (d) {
+          if (!d.innerFrameObservers) d.innerFrameObservers = [];
+          d.innerFrameObservers.push(mo);
+        }
+      } catch (_) {}
+    };
+
+    iframeEl.addEventListener('load', scan);
+    scan(); // 既にロード済みの場合も即時スキャン
+  }
+
   function installAudioObserver(url) {
     const d = subData.get(url);
     if (!d || !d.iframe) return;
@@ -302,8 +371,10 @@
       try {
         const doc = d.iframe?.contentDocument;
         if (!doc || !doc.documentElement) return false;
-        // 既存要素を 1 回スキャン
+        // 既存の audio/video を 1 回スキャン
         doc.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
+        // 既存のネスト iframe もスキャン（ギフト・ゲーム音対応）
+        doc.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
         // 動的追加を監視
         const mo = new MutationObserver((records) => {
           for (const r of records) {
@@ -312,8 +383,11 @@
               const tag = n.tagName;
               if (tag === 'VIDEO' || tag === 'AUDIO') {
                 _trackSubAudioEl(url, n);
+              } else if (tag === 'IFRAME') {
+                _trackSubIframe(url, n);
               } else if (n.querySelectorAll) {
                 n.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
+                n.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
               }
             }
           }
@@ -334,6 +408,10 @@
     const d = subData.get(url);
     if (!d) return;
     if (d.audioObserver) { d.audioObserver.disconnect(); d.audioObserver = null; }
+    if (d.innerFrameObservers) {
+      d.innerFrameObservers.forEach(mo => mo.disconnect());
+      d.innerFrameObservers = null;
+    }
   }
 
   // ─── コメント canvas キャッシュ（毎フレーム querySelectorAll の置換）──
