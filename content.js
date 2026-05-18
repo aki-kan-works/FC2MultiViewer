@@ -30,6 +30,7 @@
   // メインエリア canvas およびホバーで表示されるコントロールバー（サブ昇格時のみ存在）
   let mainCanvas       = null;
   let edgeBlurEl       = null;   // mainCanvas のふち暗化オーバーレイ（浮き感を緩和）
+  let _mainEndedBadge  = null;   // 昇格中サブが放送終了したときに mainCanvas 左上に表示するバッジ
 
   // ─── 統合 RAF ループ（メイン60fps + 全サブ24fps を 1 本に統合）──
   let _globalRafId       = 0;     // 0 のとき停止中
@@ -46,6 +47,7 @@
   let navBtn           = null;   // 「この放送に移動する」アイコン
   let _hideControlsTimer = null; // コントロールバー自動非表示タイマー
   let _sideHidden      = false;  // 右側エリアの非表示状態
+  let _liveUrlSideHidden = false; // 本放送（liveUrl）が降格する前の最大化状態を保存し、再昇格時に復元
   let _commentLayerHidden = false; // スワップ映像のコメントレイヤー非表示状態
 
   // すりガラスオーバーレイ（サブ昇格時のみ存在）
@@ -312,6 +314,11 @@
         d.videoEl = el;
         // video が差し替わった場合も描画ループは既に動いているので、キャッシュ更新のみ
       }
+      // 放送終了検出: ended / error を購読
+      try {
+        el.addEventListener('ended', () => markSubEnded(url));
+        el.addEventListener('error', () => markSubEnded(url));
+      } catch (_) {}
     }
     _applySubAudioPolicy(url, el);
     try {
@@ -360,6 +367,39 @@
     scan(); // 既にロード済みの場合も即時スキャン
   }
 
+  // ─── 放送終了マーキング ─────────────────────────────────
+  // 検出ソース:
+  //   1. video.ended / video.error イベント（_trackSubAudioEl で購読）
+  //   2. iframe 内に class*="program-end-guide" / class*="watch-rejected-information" が出現
+  //      → frame-content.js の MO が検出し chrome.runtime 経由で通知
+  // 一度 ended=true になったら撤回しない。
+
+  function _checkEndGuide(url, doc) {
+    if (!doc) return;
+    try {
+      if (
+        doc.querySelector('[class*="program-end-guide"]') ||
+        doc.querySelector('[class*="watch-rejected-information"]')
+      ) {
+        markSubEnded(url);
+      }
+    } catch (_) {}
+  }
+
+  function markSubEnded(url) {
+    const d = subData.get(url);
+    if (!d || d.ended) return;
+    d.ended = true;
+    // バー上スロットのバッジを表示
+    const slot = _slotCache.get(url);
+    if (slot) {
+      const b = slot.querySelector('.nmv2-ended-badge');
+      if (b) b.style.display = 'block';
+    }
+    // メイン昇格中ならメイン側にもバッジを出す
+    if (mainSrc === url) ensureMainEndedBadge();
+  }
+
   function installAudioObserver(url) {
     const d = subData.get(url);
     if (!d || !d.iframe) return;
@@ -375,8 +415,11 @@
         doc.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
         // 既存のネスト iframe もスキャン（ギフト・ゲーム音対応）
         doc.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
+        // 既に終了済みの放送（watch-rejected-information が存在）も初期スキャンで検出
+        _checkEndGuide(url, doc);
         // 動的追加を監視
         const mo = new MutationObserver((records) => {
+          let mayHaveEndGuide = false;
           for (const r of records) {
             for (const n of r.addedNodes) {
               if (!n || n.nodeType !== 1) continue;
@@ -389,7 +432,11 @@
                 n.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
                 n.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
               }
+              mayHaveEndGuide = true;
             }
+          }
+          if (mayHaveEndGuide && !subData.get(url)?.ended) {
+            _checkEndGuide(url, doc);
           }
         });
         mo.observe(doc.documentElement, { childList: true, subtree: true });
@@ -412,6 +459,36 @@
       d.innerFrameObservers.forEach(mo => mo.disconnect());
       d.innerFrameObservers = null;
     }
+    if (d.endGuideObserver) { d.endGuideObserver.disconnect(); d.endGuideObserver = null; }
+  }
+
+  // ─── 放送終了ガイド要素の監視（ナビゲート対応）────────────────
+  // installAudioObserver は { once: true } で初回ロード時のみ setup を実行する。
+  // ニコ生は放送終了時に iframe 内でページ遷移を行う場合があり、
+  // この関数は load イベントを持続的に監視し、遷移先ページでも終了要素を検出する。
+  function installEndGuideObserver(url) {
+    const d = subData.get(url);
+    if (!d || !d.iframe || d._endGuideObserverInstalled) return;
+    d._endGuideObserverInstalled = true;
+
+    const onLoad = () => {
+      if (subData.get(url)?.ended) return;
+      if (d.endGuideObserver) { d.endGuideObserver.disconnect(); d.endGuideObserver = null; }
+      try {
+        const doc = d.iframe?.contentDocument;
+        if (!doc || !doc.documentElement || doc.URL === 'about:blank') return;
+        _checkEndGuide(url, doc);
+        if (subData.get(url)?.ended) return;
+        const mo = new MutationObserver(() => {
+          if (!subData.get(url)?.ended) _checkEndGuide(url, doc);
+        });
+        mo.observe(doc.documentElement, { childList: true, subtree: true });
+        d.endGuideObserver = mo;
+      } catch (_) {}
+    };
+
+    d.iframe.addEventListener('load', onLoad);
+    onLoad();
   }
 
   // ─── コメント canvas キャッシュ（毎フレーム querySelectorAll の置換）──
@@ -853,6 +930,53 @@
   const MAIN_CANVAS_PAD = 5;
   const CONTROLS_HEIGHT = 48;
 
+  // ─── メイン側「放送終了」バッジ ──────────────────────────
+  function ensureMainEndedBadge() {
+    if (!mainCanvas) return;
+    if (!_mainEndedBadge) {
+      _mainEndedBadge = document.createElement('div');
+      _mainEndedBadge.id = 'nmv2-main-ended-badge';
+      _mainEndedBadge.textContent = '終了';
+      _mainEndedBadge.style.cssText = [
+        'background:rgba(160,20,20,0.92)',
+        'color:#fff',
+        'border:1px solid rgba(255,120,120,0.6)',
+        'padding:4px 12px',
+        'border-radius:5px',
+        'font-size:13px',
+        'font-weight:bold',
+        'letter-spacing:1.5px',
+        'pointer-events:none',
+        'user-select:none',
+      ].map(p => p + '!important').join(';') + ';';
+    }
+    _placeMainEndedBadge();
+  }
+
+  function removeMainEndedBadge() {
+    if (_mainEndedBadge) {
+      _mainEndedBadge.remove();
+      _mainEndedBadge = null;
+    }
+  }
+
+  function _placeMainEndedBadge() {
+    if (!_mainEndedBadge || !mainCanvas) return;
+    const pos    = isOverlayFixed() ? 'fixed' : 'absolute';
+    const target = getOverlayParent();
+    _mainEndedBadge.style.setProperty('position', pos,          'important');
+    _mainEndedBadge.style.setProperty('z-index',  '2147483647', 'important');
+    if (_mainEndedBadge.parentElement !== target) {
+      target.appendChild(_mainEndedBadge);
+    }
+    // mainCanvas の現在位置に追従させて左上へ
+    const ct = parseInt(mainCanvas.style.top,  10) || 0;
+    const cl = parseInt(mainCanvas.style.left, 10) || 0;
+    _mainEndedBadge.style.setProperty('top',       `${ct + 12}px`, 'important');
+    _mainEndedBadge.style.setProperty('left',      `${cl + 12}px`, 'important');
+    _mainEndedBadge.style.setProperty('transform', 'none',         'important');
+  }
+
   function repositionMainCanvas() {
     if (!mainCanvas) return;
     const r = findMainVideoRect();
@@ -891,6 +1015,8 @@
       controlsBar.style.setProperty('width',  `${cw}px`,                         'important');
       controlsBar.style.setProperty('height', `${CONTROLS_HEIGHT}px`,            'important');
     }
+
+    if (_mainEndedBadge) _placeMainEndedBadge();
   }
 
   function _placeCanvasEls() {
@@ -917,6 +1043,7 @@
         target.appendChild(controlsBar);
       }
     }
+    if (_mainEndedBadge) _placeMainEndedBadge();
   }
 
   function showMainCanvas(url) {
@@ -992,9 +1119,12 @@
     _drawMainPending = true;
     _ensureGlobalRaf();
     showFrost();
+
+    if (subData.get(url)?.ended) ensureMainEndedBadge();
   }
 
   function hideMainCanvas() {
+    removeMainEndedBadge();
     hideFrost();
     _drawMainPending = false;
     _mainCanvasSrc = null;
@@ -1690,9 +1820,25 @@
         doc.querySelector('a.user-thumbnail img')?.src ||
         '';
 
+      const userId =
+        sp.programProviderId  ||
+        bc.programProviderId  ||
+        us.id                 ||
+        null;
+
       if (!name && !title) return null;
-      return { title, name, thumb };
+      return { title, name, thumb, userId };
     } catch (_) { return null; }
+  }
+
+  function _applyIconClick(img, userId) {
+    if (!userId) return;
+    img.style.cursor = 'pointer';
+    img.style.pointerEvents = 'auto';
+    img.addEventListener('click', e => {
+      e.stopPropagation();
+      window.open(`https://www.nicovideo.jp/user/${userId}`, '_blank', 'noopener');
+    });
   }
 
   function updateSlotLabel(url) {
@@ -1702,7 +1848,7 @@
     if (!slot) return;
     const d = subData.get(url);
     if (!d?.meta) return;
-    const { title, name, thumb } = d.meta;
+    const { title, name, thumb, userId } = d.meta;
     if (title) slot.title = title;
     const label = slot.querySelector('.nmv2-label');
     if (!label) return;
@@ -1712,6 +1858,7 @@
       img.src = thumb;
       img.style.cssText = 'width:20px;height:20px;border-radius:50%;object-fit:cover;flex-shrink:0;';
       img.onerror = () => { img.style.display = 'none'; };
+      _applyIconClick(img, userId);
       label.appendChild(img);
     }
     const nameEl = document.createElement('span');
@@ -1845,6 +1992,7 @@
         img.src = _meta.thumb;
         img.style.cssText = 'width:20px;height:20px;border-radius:50%;object-fit:cover;flex-shrink:0;';
         img.onerror = () => { img.style.display = 'none'; };
+        _applyIconClick(img, _meta.userId);
         label.appendChild(img);
       }
       const nameEl = document.createElement('span');
@@ -1858,6 +2006,21 @@
       label.appendChild(initSpan);
     }
     slot.appendChild(label);
+
+    // 放送終了バッジ（左上）。初期は非表示、markSubEnded() で display:block に切り替え。
+    const endedBadge = document.createElement('div');
+    endedBadge.className = 'nmv2-ended-badge';
+    endedBadge.textContent = '終了';
+    endedBadge.style.cssText = `
+      position:absolute;top:3px;left:3px;z-index:2;
+      background:rgba(160,20,20,0.92);color:#fff;
+      border:1px solid rgba(255,120,120,0.6);
+      padding:2px 8px;border-radius:4px;
+      font-size:11px;font-weight:bold;letter-spacing:1px;
+      pointer-events:none;user-select:none;
+      display:${subData.get(url)?.ended ? 'block' : 'none'};
+    `;
+    slot.appendChild(endedBadge);
 
     // liveUrl（元のメイン放送）は削除すると疑似全画面が壊れるため × ボタンを非表示にする
     if (url !== liveUrl) {
@@ -2021,6 +2184,7 @@
     subUrls.push(url);
     subData.set(url, { iframe: createHiddenIframe(url), canvas: null, rafId: null, meta: null });
     installAudioObserver(url);
+    installEndGuideObserver(url);
     installCanvasObserver(url);
     loadMetaAndUpdateSlot(url);
     renderBar();
@@ -2069,6 +2233,11 @@
     const prevMain   = (mainSrc === 'live') ? liveUrl : mainSrc;
     const oldMainSrc = mainSrc;
 
+    // 本放送（liveUrl）が降格するとき、現在のユーザー設定最大化状態を記憶する。
+    if (mainSrc === 'live') {
+      _liveUrlSideHidden = _sideHidden;
+    }
+
     if (mainSrc === 'live' && !subData.has(liveUrl)) {
       subData.set(liveUrl, { iframe: null, canvas: null, rafId: null, meta: null });
       loadMetaAndUpdateSlot(liveUrl);
@@ -2081,16 +2250,17 @@
     if (oldMainSrc !== 'live') hideMainCanvas();
 
     if (mainSrc === 'live') {
+      // 本放送（liveUrl）が昇格 → 降格前にユーザーが設定した最大化状態を復元
       uninstallCanvasObserver(liveUrl);
       subData.delete(liveUrl);
+      _sideHidden = _liveUrlSideHidden;
+      document.body.classList.toggle('nmv2-side-hidden', _sideHidden);
+      updateCustomMaxBtnLabel();
     } else {
       showMainCanvas(subUrl);
-      // スワップ時はデフォルトでサイドパネルを非表示にして映像領域を最大化する。
-      // コメントレイヤーは hideMainCanvas() でリセット済みのため初期表示状態は常に「表示」。
-      if (!_sideHidden) {
-        _sideHidden = true;
-        document.body.classList.add('nmv2-side-hidden');
-      }
+      // サブ放送が昇格 → 仕様上、常に最大化で表示
+      _sideHidden = true;
+      document.body.classList.add('nmv2-side-hidden');
       updateCustomMaxBtnLabel();
     }
 
@@ -2179,8 +2349,8 @@
     const step1 = document.createElement('div');
     step1.style.cssText = 'font-size:15px;line-height:1.6;margin-bottom:16px;';
     step1.innerHTML =
-      '<b style="color:#5af;"></b> 画面下に表示された <b style="color:#5af;">「＋」</b> 領域へ、' +
-      '視聴したい放送ページのURLをドラッグ＆ドロップしてください。';
+      '視聴したい放送ページのURLをドラッグすると画面下に<b style="color:#5af;">「＋」</b> 領域が表示されます。</br>' +
+      'そのまま<b style="color:#5af;">「＋」</b> 領域へURLをドロップするとサブ放送が追加されます。';
 
     const hint = document.createElement('div');
     hint.textContent = '— クリックで閉じる —';
@@ -2277,10 +2447,13 @@
     }
 
     // 「この放送をメインにする」ボタンによる遷移データを確認（30 秒以内）
+    // URL の完全一致ではなく lv番号で照合する（live ↔ live2 サブドメイン差分を吸収）。
+    const _extractLvId = (s) => (typeof s === 'string' ? s.match(/\blv\d+/)?.[0] : null);
     try {
       const got = await chrome.storage.local.get('nmv2_transfer');
       const tr  = got['nmv2_transfer'];
-      if (tr && tr.to === liveUrl && Array.isArray(tr.subs) && Date.now() - tr.ts < 30000) {
+      const trLv = _extractLvId(tr?.to);
+      if (tr && trLv && trLv === _extractLvId(liveUrl) && Array.isArray(tr.subs) && Date.now() - tr.ts < 30000) {
         subUrls = tr.subs.filter(isNicoLiveUrl).slice(0, MAX_SUBS);
         // 音量を復元（各放送ごとの独立音量を引き継ぐ）
         if (tr.volumes && typeof tr.volumes === 'object') {
@@ -2309,6 +2482,7 @@
     for (const url of subUrls) {
       subData.set(url, { iframe: createHiddenIframe(url), canvas: null, rafId: null, meta: null });
       installAudioObserver(url);
+      installEndGuideObserver(url);
       installCanvasObserver(url);
       loadMetaAndUpdateSlot(url);
     }
@@ -2329,6 +2503,20 @@
     }
 
     setupGlobalDragReceiver();
+
+    // frame-content.js → background 中継 → ここで受け取る放送終了通知
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg?.type !== 'nmv2-sub-ended') return;
+      const _lvId = (s) => typeof s === 'string' ? s.match(/\blv\d+/)?.[0] : null;
+      const endedLv = _lvId(msg.url);
+      if (!endedLv) return;
+      for (const url of subUrls) {
+        if (_lvId(url) === endedLv) {
+          markSubEnded(url);
+          break;
+        }
+      }
+    });
 
     window.addEventListener('resize', onResize);
     setupMaximizeConstraint();
