@@ -1937,6 +1937,9 @@
 
   // ─── サブ追加・削除 ──────────────────────────────────────
   function addSub(url) {
+    // 初回起動ガイド表示中なら、ユーザーが説明通りドラッグした時点で目的達成。
+    // ガイドを閉じてから通常の追加処理に進む。
+    dismissFirstRunGuide();
     subUrls.push(url);
     subData.set(url, { iframe: createHiddenIframe(url), canvas: null, rafId: null, meta: null });
     installAudioObserver(url);
@@ -2031,6 +2034,113 @@
       }
     }
     persistState();
+  }
+
+  // ─── 初回起動ガイド ──────────────────────────────────────
+  // インストール直後の初回ロード時のみ、空のバー（＋スロット）と説明オーバーレイを
+  // 表示する。任意の場所をクリック、または最初のサブを追加した時点で dismiss し、
+  // chrome.storage.local にフラグを保存して再表示を抑止する。
+  const FIRST_RUN_KEY = 'nmv2_first_run_done';
+  let _guideOverlay      = null;
+  let _guideClickHandler = null;
+
+  async function maybeShowFirstRunGuide() {
+    // 既にサブがある状態（セッション復元など）では案内不要
+    if (subUrls.length > 0) return;
+    try {
+      const got = await chrome.storage.local.get(FIRST_RUN_KEY);
+      if (got[FIRST_RUN_KEY]) return;
+    } catch (_) {
+      // フラグ取得失敗時はフェイルオープン（表示する）
+    }
+    showFirstRunGuide();
+  }
+
+  function showFirstRunGuide() {
+    if (_guideOverlay) return;
+    // バーを pinned 状態にして「＋」スロットを画面に出す
+    // （pseudo-fs には入らない。あくまで案内表示のみ）
+    pinBar();
+
+    const ov = document.createElement('div');
+    ov.id = 'nmv2-firstrun-guide';
+    // pointer-events:none でオーバーレイ自体はクリックを素通りさせる
+    // （＋スロットへのドラッグ＆ドロップを妨げない）
+    ov.style.cssText = [
+      'position:fixed',
+      'inset:0',
+      'z-index:2147483646',
+      'background:rgba(0,0,0,0.55)',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'color:#fff',
+      'font-family:system-ui,sans-serif',
+      'user-select:none',
+      'pointer-events:none',
+    ].map(p => p + '!important').join(';') + ';';
+
+    const card = document.createElement('div');
+    // カードは pointer-events:auto にして下のニコ生 UI を遮断する
+    card.style.cssText = [
+      'background:rgba(20,20,20,0.96)',
+      'border:1px solid #5af',
+      'border-radius:12px',
+      'padding:24px 32px',
+      'max-width:520px',
+      'box-shadow:0 8px 32px rgba(0,0,0,0.5)',
+      'text-align:left',
+      'pointer-events:auto',
+      'cursor:pointer',
+    ].map(p => p + '!important').join(';') + ';';
+
+    const title = document.createElement('div');
+    title.textContent = 'NicoMultiViewer の使い方';
+    title.style.cssText = 'font-size:20px;font-weight:bold;margin-bottom:16px;color:#5af;';
+
+    const step1 = document.createElement('div');
+    step1.style.cssText = 'font-size:15px;line-height:1.6;margin-bottom:16px;';
+    step1.innerHTML =
+      '<b style="color:#5af;"></b> 画面下に表示された <b style="color:#5af;">「＋」</b> 領域へ、' +
+      '視聴したい放送ページのURLをドラッグ＆ドロップしてください。';
+
+    const hint = document.createElement('div');
+    hint.textContent = '— クリックで閉じる —';
+    hint.style.cssText = 'font-size:12px;color:#aaa;text-align:center;';
+
+    card.appendChild(title);
+    card.appendChild(step1);
+    card.appendChild(hint);
+    ov.appendChild(card);
+
+    getOverlayParent().appendChild(ov);
+    _guideOverlay = ov;
+
+    // window レベルの capture click で dismiss（バー上やカード上を含め、任意の領域）。
+    // 次イベントループから登録して、表示トリガーとなったクリックが即時 dismiss しないようにする。
+    setTimeout(() => {
+      if (!_guideOverlay) return;
+      _guideClickHandler = () => dismissFirstRunGuide();
+      window.addEventListener('click', _guideClickHandler, true);
+    }, 0);
+  }
+
+  function dismissFirstRunGuide() {
+    if (!_guideOverlay) return;
+    if (_guideClickHandler) {
+      window.removeEventListener('click', _guideClickHandler, true);
+      _guideClickHandler = null;
+    }
+    if (_guideOverlay.isConnected) _guideOverlay.remove();
+    _guideOverlay = null;
+    // 再表示抑止フラグを保存
+    try { chrome.storage.local.set({ [FIRST_RUN_KEY]: true }); } catch (_) {}
+    // サブが無ければ通常状態（バー非表示）に戻す。
+    // サブが既にある（ドラッグ起因の dismiss）場合はそのままバーを残す。
+    if (subUrls.length === 0) {
+      barVisibility = 'hidden';
+      applyBarVisibility();
+    }
   }
 
   // ─── バー本体 ────────────────────────────────────────────
@@ -2136,6 +2246,8 @@
       enterPseudoFullscreen();
     } else {
       applyBarVisibility();
+      // 初回起動時のみ、空のスロット領域と説明オーバーレイを表示する
+      maybeShowFirstRunGuide();
     }
 
     setupGlobalDragReceiver();
