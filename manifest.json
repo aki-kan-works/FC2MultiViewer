@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "NicoMultiViewer2",
+  "name": "NicoMultiViewer",
   "version": "0.1.0",
-  "description": "ニコニコ生放送を同一タブ内で複数同時視聴（canvas方式）",
+  "description": "ニコニコ生放送を同一タブ内で複数同時視聴したい",
   "permissions": ["storage", "declarativeNetRequest", "tabs"],
   "host_permissions": ["https://*.nicovideo.jp/*"],
   "background": {
