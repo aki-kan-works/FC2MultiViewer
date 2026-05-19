@@ -1358,6 +1358,7 @@
     if (_pseudoFullscreen) return;
     _pseudoFullscreen = true;
     document.body.classList.add('nmv2-pseudo-fs');
+    _syncOperationRow();   // .livePlayer 高さ制限 + operation_row 表示を初期化
     disableNicoMaximizeButton();
     showCustomMaxBtn();
     _placeCanvasEls();
@@ -1379,6 +1380,9 @@
       document.body.classList.remove('nmv2-side-hidden');
     }
     cleanLeoPlayerInnerHeight();   // インラインスタイルの残留を除去
+    // pseudo-fs 終了時に .livePlayer の高さ制限を解除して通常レイアウトに戻す
+    const _lp = document.querySelector('.livePlayer');
+    if (_lp) _lp.style.removeProperty('height');
     exitTheaterModeIfNeeded();     // シアターモードを元に戻す
     _placeCanvasEls();
     repositionMainCanvas();
@@ -2082,6 +2086,7 @@
       hideMainCanvas();
       mainSrc = 'live';
       syncAudio();
+      _syncOperationRow();
     }
 
     subUrls.splice(idx, 1);
@@ -2143,7 +2148,25 @@
       repositionMainCanvas();
     }
     // 独自最大化ボタンは FC2 では未実装（no-op）。スワップ後の状態管理だけ。
+    _syncOperationRow();
     persistState();
+  }
+
+  // ─── operation_row / livePlayer 表示制御 ─────────────────
+  // マルチビュー中: メイン=本放送のとき operation_row を表示して .livePlayer を 92% に縮め、
+  // コメント入力欄をバーの上に露出させる。サブ昇格時は逆の処理をする。
+  function _syncOperationRow() {
+    const opRow   = document.querySelector('.operation_row');
+    const lp      = document.querySelector('.livePlayer');
+    if (mainSrc !== 'live') {
+      // サブ昇格中: コメント欄を隠し、映像を全高に戻す
+      if (opRow) opRow.style.setProperty('display', 'none', 'important');
+      if (lp)   lp.style.removeProperty('height');
+    } else {
+      // 本放送がメイン: コメント欄を表示し、.livePlayer を 92% に縮める
+      if (opRow) opRow.style.removeProperty('display');
+      if (lp && subUrls.length > 0) lp.style.setProperty('height', '92%', 'important');
+    }
   }
 
   // ─── 初回起動ガイド ──────────────────────────────────────
