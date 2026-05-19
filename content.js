@@ -1206,6 +1206,19 @@
         'object-fit:contain!important;' +
         'background:#000!important;' +
       '}',
+      // コメント/ギフト canvas をプレイヤーコンテナ全域に広げる。
+      // pseudo-fs でプレイヤー高さが変わると FC2 側の canvas 位置が上端からずれ、
+      // コメントが上部でクリップされるため、top:0 / height:100% に固定する。
+      'body.nmv2-pseudo-fs #js-comment_canvas,' +
+      'body.nmv2-pseudo-fs #js-gift_canvas{' +
+        'position:absolute!important;' +
+        'top:0!important;' +
+        'left:50%!important;' +
+        'transform:translateX(-50%)!important;' +
+        'width:auto!important;' +
+        'height:100%!important;' +
+        'max-width:none!important;max-height:none!important;' +
+      '}',
       // サイド非表示モード（最大化）: 右側パネル等を畳んで映像領域を広げる
       // 注: FC2 のサイドパネル / コメント欄 / 設定パネルの具体的セレクタは TBD。
       //     ここでは画面のうちプレイヤー外の主要 wrapper を全て畳む方針で
@@ -1238,6 +1251,7 @@
       _ensureGlobalRaf();
     }
     if (mainCanvas) repositionMainCanvas();
+    _updateFloatingAddBtn();
   }
 
   function showBarPreview() {
@@ -1706,6 +1720,191 @@
     return slot;
   }
 
+  // ─── ザッピングピッカー ──────────────────────────────────
+  // 「＋」クリック時に allchannellist.php から番組一覧を取得してポップアップを表示する。
+  function _openZappingPicker(anchorEl) {
+    // 既に開いていたらトグルで閉じる
+    const existing = document.getElementById('nmv2-zapping-picker');
+    if (existing) { existing.remove(); return; }
+
+    const rect = anchorEl.getBoundingClientRect();
+    const leftPos = Math.min(Math.max(0, rect.left), window.innerWidth - 328);
+    const picker = document.createElement('div');
+    picker.id = 'nmv2-zapping-picker';
+    picker.style.cssText = [
+      'position:fixed',
+      `left:${leftPos}px`,
+      `bottom:${window.innerHeight - rect.top + 8}px`,
+      'width:320px',
+      'max-height:70vh',
+      'overflow-y:auto',
+      'overflow-x:hidden',
+      'background:#1a1a1a',
+      'border:1px solid #444',
+      'border-radius:8px',
+      'z-index:2147483646',
+      'box-shadow:0 4px 24px rgba(0,0,0,0.8)',
+      'font-family:sans-serif',
+      'color:#eee',
+    ].join(';');
+
+    // ヘッダー
+    const header = document.createElement('div');
+    header.style.cssText = [
+      'padding:8px 10px',
+      'font-size:12px',
+      'color:#bbb',
+      'border-bottom:1px solid #333',
+      'display:flex',
+      'justify-content:space-between',
+      'align-items:center',
+      'position:sticky',
+      'top:0',
+      'background:#1a1a1a',
+      'z-index:1',
+    ].join(';');
+    const titleEl = document.createElement('span');
+    titleEl.textContent = '放送一覧から追加';
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '×';
+    closeBtn.style.cssText = 'cursor:pointer;color:#888;font-size:16px;padding:0 2px;';
+    closeBtn.addEventListener('click', (e) => { e.stopPropagation(); picker.remove(); });
+    header.appendChild(titleEl);
+    header.appendChild(closeBtn);
+    picker.appendChild(header);
+
+    // ローディング表示
+    const loadingEl = document.createElement('div');
+    loadingEl.style.cssText = 'padding:20px;color:#888;font-size:13px;text-align:center;';
+    loadingEl.textContent = '読み込み中…';
+    picker.appendChild(loadingEl);
+
+    document.body.appendChild(picker);
+
+    // ピッカー外クリックで閉じる（setTimeout でトグルクリックと干渉しないようにする）
+    const onOutsideClick = (e) => {
+      if (!picker.isConnected) { document.removeEventListener('click', onOutsideClick, true); return; }
+      if (!picker.contains(e.target) && !anchorEl.contains(e.target)) {
+        picker.remove();
+        document.removeEventListener('click', onOutsideClick, true);
+      }
+    };
+    setTimeout(() => document.addEventListener('click', onOutsideClick, true), 0);
+
+    // allchannellist.php から番組一覧を取得して描画
+    fetch('https://live.fc2.com/contents/allchannellist.php')
+      .then(r => r.json())
+      .then(data => {
+        if (!picker.isConnected) return;
+        loadingEl.remove();
+        const channels = Array.isArray(data?.channel) ? data.channel : [];
+        channels.sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
+        if (channels.length === 0) {
+          const msg = document.createElement('div');
+          msg.style.cssText = 'padding:20px;color:#888;font-size:13px;text-align:center;';
+          msg.textContent = '放送中の番組はありません';
+          picker.appendChild(msg);
+          return;
+        }
+        const list = document.createElement('div');
+        channels.forEach(ch => {
+          const url = `https://live.fc2.com/${ch.id}/`;
+          const item = document.createElement('div');
+          item.style.cssText = [
+            'display:flex',
+            'align-items:center',
+            'gap:8px',
+            'padding:6px 10px',
+            'cursor:pointer',
+            'border-bottom:1px solid #252525',
+          ].join(';');
+          item.addEventListener('mouseenter', () => { item.style.background = '#272727'; });
+          item.addEventListener('mouseleave', () => { item.style.background = ''; });
+
+          const thumb = document.createElement('img');
+          thumb.style.cssText = 'width:80px;height:45px;object-fit:cover;flex:0 0 auto;border-radius:3px;background:#333;';
+          if (ch.image) thumb.src = ch.image;
+          thumb.onerror = () => { thumb.style.visibility = 'hidden'; };
+
+          const info = document.createElement('div');
+          info.style.cssText = 'flex:1;min-width:0;';
+
+          const titleDiv = document.createElement('div');
+          titleDiv.textContent = ch.title || ch.name || '（タイトルなし）';
+          titleDiv.style.cssText = 'font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#eee;';
+
+          const metaDiv = document.createElement('div');
+          metaDiv.textContent = `${ch.name || ''}  👁 ${ch.count ?? 0}`;
+          metaDiv.style.cssText = 'font-size:11px;color:#777;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+          info.appendChild(titleDiv);
+          info.appendChild(metaDiv);
+          item.appendChild(thumb);
+          item.appendChild(info);
+
+          item.addEventListener('click', () => {
+            picker.remove();
+            if (subUrls.length >= MAX_SUBS) return;
+            if (url === liveUrl || subUrls.includes(url)) return;
+            addSub(url);
+          });
+
+          list.appendChild(item);
+        });
+        picker.appendChild(list);
+      })
+      .catch(() => {
+        if (!picker.isConnected) return;
+        loadingEl.textContent = '番組一覧を取得できませんでした';
+      });
+  }
+
+  // ─── 左下フローティング「＋」ボタン ──────────────────────
+  // バーが非表示（サブ未追加）のときに常時表示するエントリポイント。
+  let _floatingAddBtn = null;
+
+  function _ensureFloatingAddBtn() {
+    if (_floatingAddBtn && _floatingAddBtn.isConnected) return _floatingAddBtn;
+    const btn = document.createElement('div');
+    btn.id = 'nmv2-floating-add';
+    btn.textContent = '＋';
+    btn.title = '放送を追加';
+    btn.style.cssText = [
+      'position:fixed',
+      'bottom:12px',
+      'left:12px',
+      'width:36px',
+      'height:36px',
+      'border-radius:50%',
+      'background:rgba(20,20,20,0.85)',
+      'border:2px solid #555',
+      'color:#aaa',
+      'font-size:20px',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'cursor:pointer',
+      'z-index:2147483645',
+      'user-select:none',
+      'box-shadow:0 2px 8px rgba(0,0,0,0.6)',
+    ].join(';');
+    btn.addEventListener('mouseenter', () => { btn.style.borderColor = '#fff'; btn.style.color = '#fff'; });
+    btn.addEventListener('mouseleave', () => { btn.style.borderColor = '#555'; btn.style.color = '#aaa'; });
+    btn.addEventListener('click', () => _openZappingPicker(btn));
+    _floatingAddBtn = btn;
+    return btn;
+  }
+
+  function _updateFloatingAddBtn() {
+    if (barVisibility === 'hidden') {
+      const btn = _ensureFloatingAddBtn();
+      if (!btn.isConnected) (document.body || document.documentElement).appendChild(btn);
+      btn.style.display = 'flex';
+    } else if (_floatingAddBtn) {
+      _floatingAddBtn.style.display = 'none';
+    }
+  }
+
   function createPlusSlot() {
     const plus = document.createElement('div');
     plus.className = 'nmv2-plus';
@@ -1713,7 +1912,7 @@
       width:${SLOT_W}px;height:${SLOT_H}px;flex:0 0 auto;
       display:flex;align-items:center;justify-content:center;
       border:2px dashed #666;background:#1a1a1a;
-      color:#aaa;font-size:64px;cursor:default;
+      color:#aaa;font-size:64px;cursor:pointer;
       user-select:none;box-sizing:border-box;
     `;
     const label = document.createElement('div');
@@ -1760,6 +1959,13 @@
       if (url === liveUrl || subUrls.includes(url)) return;
       addSub(url);
     });
+
+    // クリックでザッピングピッカーを開く（ドラッグ中は発火しない）
+    plus.addEventListener('click', () => {
+      if (subUrls.length >= MAX_SUBS) return;
+      _openZappingPicker(plus);
+    });
+
     return plus;
   }
 
