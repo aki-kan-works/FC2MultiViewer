@@ -639,6 +639,8 @@
   }
 
   // 映像スナップショットを 24fps で更新する（重い drawImage(video) を抑制）
+  // アスペクト比を維持してレターボックス/ピラーボックス描画し、
+  // 描画矩形を d._videoSnapRect に保存してコメント合成位置と共有する。
   function _updateVideoSnapshot(d, url) {
     const v = getVideoEl(url);
     if (!v || v.readyState < 2) return;
@@ -650,7 +652,21 @@
       d._videoSnap.height = dh;
       d._videoSnapCtx = d._videoSnap.getContext('2d', { alpha: false });
     }
-    d._videoSnapCtx.drawImage(v, 0, 0, dw, dh);
+    const ctx = d._videoSnapCtx;
+    ctx.clearRect(0, 0, dw, dh);
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (vw > 0 && vh > 0) {
+      const scale = Math.min(dw / vw, dh / vh);
+      const sw = Math.round(vw * scale);
+      const sh = Math.round(vh * scale);
+      const sx = Math.round((dw - sw) / 2);
+      const sy = Math.round((dh - sh) / 2);
+      ctx.drawImage(v, sx, sy, sw, sh);
+      d._videoSnapRect = { x: sx, y: sy, w: sw, h: sh };
+    } else {
+      ctx.drawImage(v, 0, 0, dw, dh);
+      d._videoSnapRect = { x: 0, y: 0, w: dw, h: dh };
+    }
   }
 
   // スロット描画：映像は snapshot（24fps）、コメントは毎 RAF（60fps）
@@ -662,7 +678,7 @@
       if (d._videoSnap) {
         ctx.drawImage(d._videoSnap, 0, 0);
       }
-      // コメント：毎 RAF + スムージングで滑らかに縮小描画
+      // コメント：スロット全域に縮小描画（コメント座標系はスロット全体を基準とする）
       const cs = d.commentCanvases;
       if (cs && cs.length > 0) {
         const dw = d.canvas.width, dh = d.canvas.height;
