@@ -11,7 +11,7 @@
       ]
     },
     "condition": {
-      "requestDomains": ["live.nicovideo.jp", "live2.nicovideo.jp"],
+      "requestDomains": ["live.fc2.com"],
       "resourceTypes": ["main_frame", "sub_frame"]
     }
   }

@@ -2,7 +2,13 @@
   'use strict';
 
   const MAX_SUBS = 4;
-  const NICO_LIVE_RE = /^https?:\/\/live2?\.nicovideo\.jp\/watch\/lv\d+/i;
+  const FC2_LIVE_RE = /^https?:\/\/live\.fc2\.com\/\d+\/?/i;
+
+  function _extractFc2Id(s) {
+    if (typeof s !== 'string') return null;
+    const m = s.match(/^https?:\/\/live\.fc2\.com\/(\d+)/i);
+    return m ? m[1] : null;
+  }
 
   // ウィンドウ幅に連動するスロット寸法（リサイズ時に更新）
   let SLOT_W = 320;
@@ -53,27 +59,15 @@
   // すりガラスオーバーレイ（サブ昇格時のみ存在）
   let frostEl = null;
 
-  // NMV2 独自全画面
-  let _leoPlayer      = null;
-  let _playerFixed    = false;
+  // ネイティブ全画面（document.fullscreenElement とは別系統の独自全画面フラグ）。
+  // FC2 では常に false（ニコ生固有の data-player-layout-mode 監視は廃止）。
   let _nmv2Fullscreen = false;
 
   // 強制全画面モード（pseudo-fullscreen）関連
-  // ニコ生ネイティブの最大化 (data-player-layout-mode="full") を使わず、
-  // 独自CSSで似たレイアウトを実現する。サブiframeのコメント描画停止を回避する。
+  // body にクラスを付与し、CSS で #js-livePlayerContainer をビューポート最大化する。
   let barVisibility   = 'hidden';   // 'hidden' | 'preview' | 'pinned'
   let _pseudoFullscreen = false;
   let _dragLeaveTimer = null;
-  let _maxBtnObserver = null;
-
-  // 独自最大化ボタン（ニコ生最大化ボタンの位置にオーバーレイ）
-  let customMaxBtn         = null;
-  let _ctrlBtnObserver    = null;  // controls bar の MutationObserver（ボタン再挿入用）
-  // forceLeoPlayerInnerHeight 用 Observers（300ms ポーリングを置換）
-  let _forceHeightRO       = null; // ResizeObserver: leo-player サイズ変化
-  let _forceHeightMO       = null; // MutationObserver: 直下構造の差し替え
-  let _forceHeightTimer    = 0;    // debounce タイマー（100ms 上限で連発抑制）
-  let _enteredTheaterMode  = false; // pseudo-fs 時に我々がシアターモードを起動したかどうか
 
   // オーバーレイ要素（canvas/frost等）の正しい親要素を返す
   // ネイティブ全画面中はフルスクリーン要素へ、それ以外は document.body へ
@@ -90,8 +84,8 @@
   }
 
   // ─── ユーティリティ ─────────────────────────────────────
-  function isNicoLiveUrl(s) {
-    return typeof s === 'string' && NICO_LIVE_RE.test(s.trim());
+  function isFc2LiveUrl(s) {
+    return typeof s === 'string' && FC2_LIVE_RE.test(s.trim());
   }
 
   function extractUrlFromDataTransfer(dt) {
@@ -100,7 +94,7 @@
       const raw = dt.getData(type);
       if (!raw) continue;
       for (const line of raw.split(/\r?\n/).map(s => s.trim())) {
-        if (line && !line.startsWith('#') && isNicoLiveUrl(line)) return line;
+        if (line && !line.startsWith('#') && isFc2LiveUrl(line)) return line;
       }
     }
     return '';
@@ -115,31 +109,54 @@
     } catch (_) {}
   }
 
-  // ─── video / leo-player 要素キャッシュ ───────────────────
+  // ─── video / プレイヤー要素キャッシュ ───────────────────
   // RAF 内・リサイズ時など高頻度パスでの querySelector を排除する。
   // 値が disconnect されたら次回呼び出し時に再取得する。
   let _mainVideoEl    = null;
-  let _cachedLeoPlayer = null;
+  let _cachedFc2Player = null;
+
+  // FC2 ライブの再生 video は .js-webrtcVideo 配下の blob: ソース付き要素。
+  // 同クラスのコンテナが複数（プレロード等で）あるため、src と videoWidth で
+  // 実再生中のものを優先選択する。
+  function _pickFc2Video(doc) {
+    if (!doc) return null;
+    let candidates;
+    try { candidates = doc.querySelectorAll('.js-webrtcVideo video'); } catch (_) { return null; }
+    if (!candidates || candidates.length === 0) {
+      // フォールバック: ドキュメント内の任意の video
+      try { return doc.querySelector('video') ?? null; } catch (_) { return null; }
+    }
+    for (const v of candidates) {
+      if (v.src && v.videoWidth > 0) return v;
+    }
+    for (const v of candidates) {
+      if (v.src) return v;
+    }
+    return candidates[0] ?? null;
+  }
 
   function getVideoEl(url) {
     if (url === liveUrl) {
-      if (_mainVideoEl && _mainVideoEl.isConnected) return _mainVideoEl;
-      _mainVideoEl = document.querySelector('video') ?? null;
+      if (_mainVideoEl && _mainVideoEl.isConnected && _mainVideoEl.src) return _mainVideoEl;
+      _mainVideoEl = _pickFc2Video(document);
       return _mainVideoEl;
     }
     const d = subData.get(url);
     if (!d) return null;
-    if (d.videoEl && d.videoEl.isConnected) return d.videoEl;
+    if (d.videoEl && d.videoEl.isConnected && d.videoEl.src) return d.videoEl;
     try {
-      d.videoEl = d.iframe?.contentDocument?.querySelector('video') ?? null;
+      d.videoEl = _pickFc2Video(d.iframe?.contentDocument);
       return d.videoEl;
     } catch (_) { return null; }
   }
 
-  function _getLeoPlayer() {
-    if (_cachedLeoPlayer && _cachedLeoPlayer.isConnected) return _cachedLeoPlayer;
-    _cachedLeoPlayer = document.querySelector('[class*="leo-player"]');
-    return _cachedLeoPlayer;
+  // FC2 のプレイヤーコンテナ。最大化制御等のレイアウト基準として使う。
+  function _getFc2Player() {
+    if (_cachedFc2Player && _cachedFc2Player.isConnected) return _cachedFc2Player;
+    _cachedFc2Player = document.querySelector('#js-livePlayerContainer')
+                    || document.querySelector('.livePlayer.js-liveContainer')
+                    || document.querySelector('#js-player');
+    return _cachedFc2Player;
   }
 
   // ─── 音量管理 ─────────────────────────────────────────────
@@ -168,7 +185,7 @@
     if (!mainVideo) return;
 
     if (mainSrc === 'live') {
-      // ライブモード: ニコ生 UI 経由の音量変更を liveUrl の独立音量として追跡
+      // ライブモード: FC2 プレイヤー UI 経由の音量変更を liveUrl の独立音量として追跡
       urlVolumes.set(liveUrl, mainVideo.volume);
       return;
     }
@@ -281,9 +298,9 @@
   }
 
   // ─── サブ音声制御（旧 1500ms ポーリングをイベント駆動化）──
-  // ニコ生が video 要素を React で再作成・音量リセットしても、以下で追従する:
+  // FC2 プレイヤーが video 要素を再作成・音量リセットしても、以下で追従する:
   //   - MutationObserver(subtree childList): 新規 <video>/<audio> 出現を捕捉
-  //   - 各要素の volumechange リスナー: ニコ生による mute/volume 改変を即時是正
+  //   - 各要素の volumechange リスナー: ページ側の mute/volume 改変を即時是正
   function _applySubAudioPolicy(url, el) {
     if (_extMuting) return;
     try {
@@ -370,20 +387,28 @@
   // ─── 放送終了マーキング ─────────────────────────────────
   // 検出ソース:
   //   1. video.ended / video.error イベント（_trackSubAudioEl で購読）
-  //   2. iframe 内に class*="program-end-guide" / class*="watch-rejected-information" が出現
-  //      → frame-content.js の MO が検出し chrome.runtime 経由で通知
+  //   2. iframe.contentWindow.location が live.fc2.com/<id>/ から離脱
+  //      （存在しない／終了済みは error.fc2.com/livechat/... へリダイレクトされる）
+  //      → frame-content.js が検出し chrome.runtime 経由で通知 + ここで補助確認
   // 一度 ended=true になったら撤回しない。
 
-  function _checkEndGuide(url, doc) {
-    if (!doc) return;
+  function _checkEndGuide(url, iframeOrDoc) {
     try {
-      if (
-        doc.querySelector('[class*="program-end-guide"]') ||
-        doc.querySelector('[class*="watch-rejected-information"]')
-      ) {
+      // 直接 iframe を受け取った場合は contentWindow.location を確認
+      let href = '';
+      if (iframeOrDoc && iframeOrDoc.contentWindow) {
+        href = iframeOrDoc.contentWindow.location.href || '';
+      } else if (iframeOrDoc && iframeOrDoc.URL) {
+        href = iframeOrDoc.URL;
+      }
+      if (!href || href === 'about:blank') return;
+      if (!FC2_LIVE_RE.test(href)) {
         markSubEnded(url);
       }
-    } catch (_) {}
+    } catch (_) {
+      // クロスオリジン例外（error.fc2.com に飛んだ場合等）= 終了とみなす
+      markSubEnded(url);
+    }
   }
 
   function markSubEnded(url) {
@@ -415,7 +440,7 @@
         doc.querySelectorAll('video, audio').forEach(el => _trackSubAudioEl(url, el));
         // 既存のネスト iframe もスキャン（ギフト・ゲーム音対応）
         doc.querySelectorAll('iframe').forEach(f => _trackSubIframe(url, f));
-        // 既に終了済みの放送（watch-rejected-information が存在）も初期スキャンで検出
+        // 既に終了済み・存在しない放送（error.fc2.com 等へのリダイレクト）を初期スキャンで検出
         _checkEndGuide(url, doc);
         // 動的追加を監視
         const mo = new MutationObserver((records) => {
@@ -462,10 +487,10 @@
     if (d.endGuideObserver) { d.endGuideObserver.disconnect(); d.endGuideObserver = null; }
   }
 
-  // ─── 放送終了ガイド要素の監視（ナビゲート対応）────────────────
+  // ─── 放送終了監視（リダイレクト対応）────────────────────
   // installAudioObserver は { once: true } で初回ロード時のみ setup を実行する。
-  // ニコ生は放送終了時に iframe 内でページ遷移を行う場合があり、
-  // この関数は load イベントを持続的に監視し、遷移先ページでも終了要素を検出する。
+  // FC2 ライブは放送終了時に error.fc2.com 系へリダイレクトする場合があり、
+  // この関数は load イベントを持続的に監視し、遷移先 URL を検査して終了を検出する。
   function installEndGuideObserver(url) {
     const d = subData.get(url);
     if (!d || !d.iframe || d._endGuideObserverInstalled) return;
@@ -474,13 +499,18 @@
     const onLoad = () => {
       if (subData.get(url)?.ended) return;
       if (d.endGuideObserver) { d.endGuideObserver.disconnect(); d.endGuideObserver = null; }
+      // まず iframe レベルでリダイレクト先 URL を確認する。
+      // クロスオリジン遷移（error.fc2.com 等）では contentDocument が null になるため、
+      // 直接 contentWindow.location を参照する _checkEndGuide にハンドリングを任せる。
+      _checkEndGuide(url, d.iframe);
+      if (subData.get(url)?.ended) return;
       try {
         const doc = d.iframe?.contentDocument;
         if (!doc || !doc.documentElement || doc.URL === 'about:blank') return;
-        _checkEndGuide(url, doc);
-        if (subData.get(url)?.ended) return;
+        // 同一オリジン（live.fc2.com）ロード時は DOM 変化も監視（プレイヤー側で
+        // 終了 UI が動的に差し込まれるケースの保険）
         const mo = new MutationObserver(() => {
-          if (!subData.get(url)?.ended) _checkEndGuide(url, doc);
+          if (!subData.get(url)?.ended) _checkEndGuide(url, d.iframe);
         });
         mo.observe(doc.documentElement, { childList: true, subtree: true });
         d.endGuideObserver = mo;
@@ -491,20 +521,19 @@
     onLoad();
   }
 
-  // ─── コメント canvas キャッシュ（毎フレーム querySelectorAll の置換）──
-  // iframe（または liveUrl のとき main document）内の <canvas> を MutationObserver
-  // で観測し、d.commentCanvases にキャッシュする。RAF 内では配列を直接イテレート。
+  // ─── コメント / ギフト canvas キャッシュ ────────────────
+  // FC2 ライブはコメント描画 (#js-comment_canvas) とギフト描画 (#js-gift_canvas) を
+  // それぞれ固定 ID の canvas に行う。RAF 内ではこの 2 枚だけを合成すれば足りる。
+  // 他に setting panel 等で canvas が出現することがあるが、ここでは ID 指定で除外する。
   function _refreshCanvasCache(url, doc) {
     const d = subData.get(url);
     if (!d) return;
     const cs = [];
     try {
-      doc.querySelectorAll('canvas').forEach(c => {
-        if (c === mainCanvas) return;          // メイン canvas（自前）
-        if (c === d.canvas) return;            // バースロット canvas（自前）
-        if (c.closest && c.closest('#nmv2-bar')) return; // 全バー canvas
-        cs.push(c);
-      });
+      const comment = doc.getElementById('js-comment_canvas');
+      const gift    = doc.getElementById('js-gift_canvas');
+      if (comment) cs.push(comment);
+      if (gift)    cs.push(gift);
     } catch (_) {}
     d.commentCanvases = cs;
   }
@@ -589,7 +618,7 @@
         _mainVidScanTimer = 0;
         ensureVolumeListener();
         // メイン video キャッシュを更新
-        _mainVideoEl = document.querySelector('video') ?? null;
+        _mainVideoEl = _pickFc2Video(document);
         // mainSrc != 'live' のときはネイティブ video を必ずミュート保持
         if (mainSrc !== 'live' && _mainVideoEl && !_mainVideoEl.muted) {
           _extMuting = true;
@@ -764,18 +793,18 @@
 
   // ─── メインcanvas（サブ昇格時）──────────────────────────
   function findMainVideoRect() {
-    // pseudo-fs モードでは leo-player を基準にする。
-    // ニコ生内部の video 要素は height:auto の連鎖で leo-player 全高に届かない
-    // ことがあるため、信頼性の高い leo-player の rect から
-    // 「高さ＝leo-player 全高」「横位置・幅＝パネル状態に応じて切替」を組み立てる。
+    // pseudo-fs モードでは FC2 プレイヤーコンテナを基準にする。
+    // 内部 video の親要素は height:auto 連鎖でコンテナ全高に届かないことが多いため、
+    // コンテナの rect から「高さ＝コンテナ全高」「横位置・幅＝パネル状態に応じて切替」
+    // を組み立てる。
     if (_pseudoFullscreen) {
-      const lp = _getLeoPlayer();
+      const lp = _getFc2Player();
       if (lp) {
         const lpRect = lp.getBoundingClientRect();
         if (lpRect.width > 0 && lpRect.height > 0) {
-          // パネル非表示時: leo-player 全域を使う
+          // サイド非表示時: プレイヤーコンテナ全域を使う
           if (_sideHidden) return lpRect;
-          // パネル表示時: 横は video 要素に追従、縦は leo-player 全高に固定
+          // サイド表示時: 横は video 要素に追従、縦はコンテナ全高に固定
           const v = getVideoEl(liveUrl);
           if (v) {
             const r = v.getBoundingClientRect();
@@ -873,7 +902,7 @@
     volumeSlider.addEventListener('input', () => {
       const vol = Math.max(0, Math.min(1, parseInt(volumeSlider.value, 10) / 100));
       // メイン放送ごとに音量を独立保持。mainVideo には書き込まない
-      // （書き込むとニコ生 UI 側の表示が乱れたり、ライブ放送に副作用が出るため）
+      // （書き込むとページ側 UI 表示が乱れたり、本放送に副作用が出るため）
       urlVolumes.set(mainSrc, vol);
       if (mainSrc !== 'live') {
         const d = subData.get(mainSrc);
@@ -1081,8 +1110,8 @@
     }
     // 「移動する」アイコンのタイトルを現在のメインに合わせて更新
     if (navBtn) {
-      const lvId = mainSrc.match(/lv\d+/)?.[0] ?? '';
-      navBtn.title = `この放送をメインにする${lvId ? '（' + lvId + '）' : ''}`;
+      const fc2Id = _extractFc2Id(mainSrc) ?? '';
+      navBtn.title = `この放送をメインにする${fc2Id ? '（' + fc2Id + '）' : ''}`;
     }
     _placeCanvasEls();
 
@@ -1145,44 +1174,19 @@
     // リセットは exitPseudoFullscreen()（サブ全削除時）で行う。
   }
 
-  // ─── ニコ生最大化のスロット被り対策 ──────────────────────
-  // 診断で判明したこと:
-  //   - 最大化フラグは #watchPage の data-player-layout-mode="full" 属性
-  //   - leo-player はインラインスタイル無し → CSS !important で確実に勝てる
-  //   - 既存コードは [class*="player-display"][data-layout-mode] を見ていたが、
-  //     data-layout-mode は watchPage (祖先) に "liquid" として常に付いており、
-  //     最大化検知としては誤りだった。
-  (function () {
-    const styleEl = document.createElement('style');
-    styleEl.id = 'nmv2-maximize-guard';
-    // CSS のみで leo-player を制約する。
-    // セレクタ: data-player-layout-mode="full" を持つ祖先（watchPage）の
-    // 子孫の leo-player に対して、サイズと位置を強制する。
-    styleEl.textContent =
-      `[data-player-layout-mode="full"] [class*="leo-player"]{` +
-      `position:fixed!important;` +
-      `top:0!important;left:0!important;right:0!important;` +
-      `bottom:var(--nmv2-bar-h,192px)!important;` +
-      `height:calc(100vh - var(--nmv2-bar-h,192px))!important;` +
-      `max-height:calc(100vh - var(--nmv2-bar-h,192px))!important;` +
-      `overflow:hidden!important;` +
-      `z-index:2147483640!important;}`;
-    document.head.appendChild(styleEl);
-  })();
-
   // ─── 強制全画面モード（pseudo-fullscreen）─────────────────
-  // ニコ生ネイティブの最大化（data-player-layout-mode="full"）はサブiframeの
-  // コメント描画を停止させるため使えない。代替として body にクラスを付与し、
-  // 静的CSSで leo-player をビューポート最大化する。
+  // FC2 ライブのプレイヤーコンテナ (#js-livePlayerContainer) を、バー高さ分を
+  // 残してビューポート全面に固定する。サブ放送ありの状態で常に適用する。
+  // 注: FC2 の右側エリア・コメント入力欄等の周辺UI非表示セレクタは推測。
+  //     構造変化時は実機で再採取が必要。
   (function () {
     const styleEl = document.createElement('style');
     styleEl.id = 'nmv2-pseudo-fs-style';
-    // 注: 周辺UI非表示セレクタは推測。ニコ生のDOMが変わった場合は実機で再採取が必要。
     styleEl.textContent = [
       // ページ全体のスクロール抑止
       'body.nmv2-pseudo-fs{overflow:hidden!important;}',
-      // leo-player をビューポート全面に固定（バー高さ分だけ下端を空ける）
-      'body.nmv2-pseudo-fs [class*="leo-player"]{' +
+      // プレイヤーコンテナをビューポート全面に固定（バー高さ分だけ下端を空ける）
+      'body.nmv2-pseudo-fs #js-livePlayerContainer{' +
         'position:fixed!important;' +
         'top:0!important;left:0!important;right:0!important;' +
         'bottom:var(--nmv2-bar-h,0px)!important;' +
@@ -1193,81 +1197,26 @@
         'background:#000!important;' +
       '}',
       // 元放送のアスペクト比を維持（黒レターボックス）
-      'body.nmv2-pseudo-fs [class*="leo-player"] video{' +
+      'body.nmv2-pseudo-fs #js-livePlayerContainer .js-webrtcVideo,' +
+      'body.nmv2-pseudo-fs #js-livePlayerContainer #js-video_area{' +
+        'width:100%!important;height:100%!important;' +
+      '}',
+      'body.nmv2-pseudo-fs #js-livePlayerContainer video{' +
         'width:100%!important;height:100%!important;' +
         'object-fit:contain!important;' +
         'background:#000!important;' +
       '}',
-      // 周辺UI（コメント入力欄・コメント一覧・番組情報パネル等）を非表示
-      // :has() は Chromium 105+ で利用可。leo-player を含まない兄弟要素を畳む。
-      'body.nmv2-pseudo-fs #watchPage > *:not(:has([class*="leo-player"])){' +
+      // サイド非表示モード（最大化）: 右側パネル等を畳んで映像領域を広げる
+      // 注: FC2 のサイドパネル / コメント欄 / 設定パネルの具体的セレクタは TBD。
+      //     ここでは画面のうちプレイヤー外の主要 wrapper を全て畳む方針で
+      //     #header, #footer, .l-twoColumn 等を非表示にする（実機で要調整）。
+      'body.nmv2-side-hidden #header,' +
+      'body.nmv2-side-hidden #footer,' +
+      'body.nmv2-side-hidden #js-side_area,' +
+      'body.nmv2-side-hidden .js-side_area,' +
+      'body.nmv2-side-hidden #js-right_area,' +
+      'body.nmv2-side-hidden .js-right_area{' +
         'display:none!important;' +
-      '}',
-      // ニコ生最大化／全画面ボタンを非表示（独自ボタンがその直前に挿入されるため不要）。
-      // display:none でスペースを詰める。querySelector() は display:none でも動作するため問題なし。
-      'body.nmv2-pseudo-fs button[aria-label*="最大化"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="フルスクリーン"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="全画面"],' +
-      'body.nmv2-pseudo-fs [class*="MaximizeButton"],' +
-      'body.nmv2-pseudo-fs [class*="FullscreenButton"]{' +
-        'display:none!important;' +
-      '}',
-      // pseudo-fs モードでは映像コンテナが leo-player 全高を常に埋めるよう強制する。
-      // ニコ生内部は height:auto / aspect-ratio:16/9 / padding-top:56.25% などで
-      // 自然サイズに留まる連鎖になっているため、それらを明示的に解除する。
-      // :has(video) で video 要素の祖先 wrapper を一括捕捉（パネル・フッターは除外）。
-      // 注意: [class*="player-display"] は [class*="player-display-footer"] にもマッチするため
-      //       :not([class*="footer"]) で明示除外する（誤適用でコントロールバーが上端に飛ぶのを防ぐ）。
-      'body.nmv2-pseudo-fs [class*="leo-player"] *:has(video):not([class*="player-status-panel"]):not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="video-display"]:not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="player-display"]:not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="player-display-screen"],' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="video-container"]:not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="VideoContainer"]:not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="player-area"]:not([class*="footer"]),' +
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="PlayerArea"]:not([class*="footer"]){' +
-        'height:100%!important;' +
-        'max-height:none!important;' +
-        'min-height:0!important;' +
-        'aspect-ratio:auto!important;' +
-        'padding-top:0!important;' +
-        'padding-bottom:0!important;' +
-      '}',
-      // コントロールバー（player-display-footer）は高さ制約ルールから除外し、
-      // position:absolute で leo-player（position:fixed）の下端に固定する。
-      'body.nmv2-pseudo-fs [class*="leo-player"] [class*="player-display-footer"]{' +
-        'position:absolute!important;' +
-        'bottom:0!important;left:0!important;width:100%!important;' +
-        'height:auto!important;max-height:none!important;flex:none!important;' +
-      '}',
-      // シアターモードボタン・デフォルト表示ボタンは pseudo-fs 中に自動制御するため非表示にする
-      'body.nmv2-pseudo-fs button[aria-label*="シアター"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="Theater"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="デフォルト"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="通常表示"],' +
-      'body.nmv2-pseudo-fs button[aria-label*="小画面"],' +
-      'body.nmv2-pseudo-fs [class*="TheaterButton"],' +
-      'body.nmv2-pseudo-fs [class*="theaterButton"],' +
-      'body.nmv2-pseudo-fs [class*="DefaultButton"],' +
-      'body.nmv2-pseudo-fs [class*="defaultButton"]{' +
-        'display:none!important;' +
-      '}',
-      // 右側エリア（player-status-panel）非表示トグル
-      // ニコ生のクラスは ___player-status-panel___ のような難読化形式なので部分一致で拾う
-      'body.nmv2-side-hidden [class*="player-status-panel"]{' +
-        'display:none!important;' +
-      '}',
-      // パネル非表示時、leo-player 内の映像領域を最大化（flex/grid 兄弟が縮んだ分を埋める）。
-      // :not([class*="footer"]) でコントロールバーを誤って対象にしないよう除外する。
-      'body.nmv2-side-hidden [class*="leo-player"] [class*="video-display"]:not([class*="footer"]),' +
-      'body.nmv2-side-hidden [class*="leo-player"] [class*="player-display"]:not([class*="footer"]),' +
-      'body.nmv2-side-hidden [class*="leo-player"] [class*="video-container"]:not([class*="footer"]),' +
-      'body.nmv2-side-hidden [class*="leo-player"] [class*="VideoContainer"]:not([class*="footer"]){' +
-        'width:100%!important;height:100%!important;flex:1 1 auto!important;' +
-      '}',
-      // video 要素にもアスペクト比維持を適用（横幅が広がった際に縦が置いてかれないよう）
-      'body.nmv2-side-hidden [class*="leo-player"] video{' +
-        'width:100%!important;object-fit:contain!important;' +
       '}',
     ].join('');
     document.head.appendChild(styleEl);
@@ -1369,34 +1318,10 @@
     }, true);
   }
 
-  // ─── シアターモード制御 ──────────────────────────────────
-  // pseudo-fs 開始時に自動でシアターモードに入り、終了時に元に戻す。
-  function _getTheaterBtn() {
-    return document.querySelector(
-      'button[aria-label*="シアター"], button[aria-label*="Theater"], ' +
-      '[class*="TheaterButton"], [class*="theaterButton"]'
-    );
-  }
-
-  function enterTheaterModeIfNeeded() {
-    if (_enteredTheaterMode) return;
-    const btn = _getTheaterBtn();
-    if (!btn) return;
-    // aria-pressed="true" 等でシアターモード中かチェック。すでにアクティブなら何もしない。
-    const isActive = btn.getAttribute('aria-pressed') === 'true' ||
-                     btn.getAttribute('data-enable') === 'true';
-    if (!isActive) {
-      btn.click();
-      _enteredTheaterMode = true;
-    }
-  }
-
-  function exitTheaterModeIfNeeded() {
-    if (!_enteredTheaterMode) return;
-    _enteredTheaterMode = false;
-    const btn = _getTheaterBtn();
-    if (btn) btn.click();
-  }
+  // FC2 ライブには「シアターモード」相当の機能が無いため no-op。
+  // ニコ生からの移植時に同名関数の呼び出し箇所を残しているが、何もしない。
+  function enterTheaterModeIfNeeded() { /* no-op (FC2) */ }
+  function exitTheaterModeIfNeeded()  { /* no-op (FC2) */ }
 
   // ─── 強制全画面モードの開始／終了 ────────────────────────
   function enterPseudoFullscreen() {
@@ -1429,267 +1354,25 @@
     repositionMainCanvas();
   }
 
-  // ─── 独自最大化ボタン（ニコ生最大化ボタン位置にオーバーレイ）──
-  // ニコ生ネイティブの最大化ボタンは pseudo-fs 中は CSS で opacity:0 にしてあるため、
-  // 同じ位置（getBoundingClientRect）に独自ボタンを重ねる。
-  // 押下で _sideHidden を切り替え、コメント欄を畳んで映像を最大化する。
+  // ─── カスタム最大化ボタン（FC2 では未実装）──────────────
+  // ニコ生版ではネイティブの最大化ボタン位置に独自ボタンを重ねていたが、
+  // FC2 ライブには等価なボタンが無いため初期実装では UI 用意なし。
+  // _sideHidden の切り替えは swapWithMain() の自動制御のみ。
+  function showCustomMaxBtn() { /* no-op (FC2) */ }
+  function hideCustomMaxBtn() { /* no-op (FC2) */ }
+  function insertCustomMaxBtn() { /* no-op (FC2) */ }
+  function updateCustomMaxBtnLabel() { /* no-op (FC2) */ }
+  function cleanLeoPlayerInnerHeight() { /* no-op (FC2) — CSS のみで完結する */ }
 
-  function createCustomMaxBtn() {
-    if (customMaxBtn) return;
-    customMaxBtn = document.createElement('button');
-    customMaxBtn.id = 'nmv2-custom-max-btn';
-    customMaxBtn.type = 'button';
-    // ニコ生コントロールバーの他のボタンに合わせたスタイル。
-    // position:fixed は使わず、updateCustomMaxBtnPos() で orig の隣に DOM 挿入する。
-    customMaxBtn.style.cssText = [
-      'background:transparent',
-      'color:#fff',
-      'border:none',
-      'border-radius:4px',
-      'cursor:pointer',
-      'padding:5px',
-      'display:none',
-      'align-items:center',
-      'justify-content:center',
-      'font-size:20px',
-      'line-height:1',
-      'user-select:none',
-      'box-sizing:border-box',
-      'flex-shrink:0',
-      'align-self:center',
-    ].map(p => p + '!important').join(';') + ';';
-    updateCustomMaxBtnLabel();
-    customMaxBtn.addEventListener('mouseenter', () => {
-      customMaxBtn.style.setProperty('background', 'rgba(255,255,255,0.15)', 'important');
-    });
-    customMaxBtn.addEventListener('mouseleave', () => {
-      customMaxBtn.style.setProperty('background', 'transparent', 'important');
-    });
-    customMaxBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      _sideHidden = !_sideHidden;
-      document.body.classList.toggle('nmv2-side-hidden', _sideHidden);
-      updateCustomMaxBtnLabel();
-      // controlsBar 側の commentToggleBtn と状態同期（mainSrc!=='live' のとき存在）
-      if (commentToggleBtn) {
-        commentToggleBtn.style.setProperty('opacity', _sideHidden ? '0.5' : '1', 'important');
-        commentToggleBtn.title = _sideHidden ? 'コメント欄を表示' : 'コメント欄を非表示';
-      }
-      setTimeout(() => repositionMainCanvas(), 150);
-    });
-    // DOM への追加は updateCustomMaxBtnPos() が orig の隣に挿入する
-  }
-
-  function updateCustomMaxBtnLabel() {
-    if (!customMaxBtn) return;
-    customMaxBtn.textContent = _sideHidden ? '⮌' : '⛶';
-    customMaxBtn.title = _sideHidden ? '最大化を解除' : '最大化（コメント欄を隠す）';
-  }
-
-  // ─── ボタン挿入・Observer・interval ───────────────────────
-  // ニコ生最大化ボタン（orig）は display:none だが DOM には残るため
-  // querySelector / insertAdjacentElement は正常に動作する。
-  const _ORIG_BTN_SEL =
-    'button[aria-label*="最大化"], button[aria-label*="フルスクリーン"], ' +
-    'button[aria-label*="全画面"], [class*="MaximizeButton"], [class*="FullscreenButton"]';
-
-  function insertCustomMaxBtn() {
-    if (!customMaxBtn || !_pseudoFullscreen || mainSrc !== 'live') return;
-    const orig = document.querySelector(_ORIG_BTN_SEL);
-    if (!orig || !orig.parentElement) {
-      // controls bar がまだ DOM にない場合（ページ読み込み直後等）はリトライ
-      setTimeout(insertCustomMaxBtn, 300);
-      return;
-    }
-    if (customMaxBtn.previousElementSibling !== orig) {
-      orig.insertAdjacentElement('beforebegin', customMaxBtn);
-    }
-    customMaxBtn.style.setProperty('display', 'flex', 'important');
-    _watchCtrlBtn(orig.parentElement);
-  }
-
-  // controls bar（orig の親）を MutationObserver で監視し、
-  // React の再レンダリングでボタンが消えたら自動再挿入する
-  function _watchCtrlBtn(container) {
-    if (_ctrlBtnObserver) return;
-    _ctrlBtnObserver = new MutationObserver(() => {
-      if (!_pseudoFullscreen || mainSrc !== 'live') return;
-      if (customMaxBtn && !customMaxBtn.isConnected) insertCustomMaxBtn();
-    });
-    _ctrlBtnObserver.observe(container, { childList: true });
-  }
-
-  // forceLeoPlayerInnerHeight を Observer 駆動で実行（旧 300ms ポーリングを置換）。
-  // - ResizeObserver: leo-player の外形変化（ウィンドウリサイズ・パネル開閉等）を捕捉
-  // - MutationObserver(childList only): leo-player 直下の React 差し替えを捕捉
-  //   注: subtree:true はコメント等の頻繁な DOM 変化で過剰発火するため使用しない
-  // - 100ms debounce: 連発を抑制
-  // - 既存値と同じならスタイル書き換えをスキップ（自己トリガーの再帰回避）
-  function _scheduleForceHeight() {
-    if (_forceHeightTimer) return;
-    _forceHeightTimer = setTimeout(() => {
-      _forceHeightTimer = 0;
-      forceLeoPlayerInnerHeight();
-    }, 100);
-  }
-
-  function startForceHeightObservers() {
-    forceLeoPlayerInnerHeight(); // 初回適用
-    const lp = _getLeoPlayer();
-    if (!lp) return; // 後続の出現は pseudo-fs 再進入や setupMaximizeConstraint 経由で拾う
-    if (!_forceHeightRO) {
-      _forceHeightRO = new ResizeObserver(_scheduleForceHeight);
-      _forceHeightRO.observe(lp);
-    }
-    if (!_forceHeightMO) {
-      _forceHeightMO = new MutationObserver(_scheduleForceHeight);
-      _forceHeightMO.observe(lp, { childList: true });
-    }
-  }
-
-  function stopForceHeightObservers() {
-    if (_forceHeightRO) { _forceHeightRO.disconnect(); _forceHeightRO = null; }
-    if (_forceHeightMO) { _forceHeightMO.disconnect(); _forceHeightMO = null; }
-    if (_forceHeightTimer) { clearTimeout(_forceHeightTimer); _forceHeightTimer = 0; }
-  }
-
-  // ② 対策: video から leo-player までの親要素チェーンに leo-player の実測高さを
-  // インライン !important で強制する。
-  //
-  // 注意: display / flex-direction / position は変更しない。
-  // ニコ生プレイヤーが flex-direction:column-reverse や CSS order 等で
-  // コントロールバーを下端に配置している場合、それらを上書きすると
-  // コントロールが画面上端へ飛ぶ原因になるため。
-  function forceLeoPlayerInnerHeight() {
-    if (!_pseudoFullscreen) return;
-    const lp = _getLeoPlayer();
-    if (!lp) return;
-    const video = getVideoEl(liveUrl) || lp.querySelector('video');
-    if (!video) return;
-    const lpH = lp.getBoundingClientRect().height;
-    if (lpH <= 0) return;
-
-    const lpHpx = `${lpH}px`;
-    let el = video.parentElement;
-    let depth = 0;
-    while (el && el !== lp && depth < 12) {
-      const cls = ((el.className || '') + '');
-      // 右パネルは縦伸ばし不要なため除外
-      if (!cls.includes('player-status-panel')) {
-        // 既存値と一致するなら書き換えをスキップ（不要な MutationRecord・reflow を回避）
-        if (el.style.getPropertyValue('height') !== lpHpx ||
-            el.style.getPropertyPriority('height') !== 'important') {
-          el.style.setProperty('height',        lpHpx, 'important');
-          el.style.setProperty('max-height',    lpHpx, 'important');
-          el.style.setProperty('min-height',    '0',   'important');
-          el.style.setProperty('aspect-ratio',  'auto','important');
-          el.style.setProperty('padding-top',   '0',   'important');
-          el.style.setProperty('padding-bottom','0',   'important');
-        }
-      }
-      el = el.parentElement;
-      depth++;
-    }
-  }
-
-  // pseudo-fs 解除時に forceLeoPlayerInnerHeight() が付けたインラインスタイルを全て除去する。
-  // 残留スタイルが通常モードのレイアウトを壊すのを防ぐ。
-  function cleanLeoPlayerInnerHeight() {
-    const lp = document.querySelector('[class*="leo-player"]');
-    if (!lp) return;
-    const video = lp.querySelector('video');
-    if (!video) return;
-    const props = ['height', 'max-height', 'min-height', 'aspect-ratio',
-                   'padding-top', 'padding-bottom'];
-    let el = video.parentElement;
-    let depth = 0;
-    while (el && el !== lp && depth < 12) {
-      props.forEach(p => el.style.removeProperty(p));
-      el = el.parentElement;
-      depth++;
-    }
-  }
-
-  function showCustomMaxBtn() {
-    createCustomMaxBtn();
-    updateCustomMaxBtnLabel();
-    insertCustomMaxBtn();
-    startForceHeightObservers();
-  }
-
-  function hideCustomMaxBtn() {
-    stopForceHeightObservers();
-    if (_ctrlBtnObserver) { _ctrlBtnObserver.disconnect(); _ctrlBtnObserver = null; }
-    if (customMaxBtn) {
-      customMaxBtn.style.setProperty('display', 'none', 'important');
-      if (customMaxBtn.isConnected) customMaxBtn.remove();
-    }
-  }
-
-  // ─── ニコ生最大化ボタンの無効化（二段構え）─────────────
-  // (A) CSS で display:none （pseudo-fs style 内）
-  // (B) MutationObserver + click ハンドラでクリックを握りつぶす（セレクタ変化への保険）
-  function _nmv2StopMaximizeClick(e) {
-    if (!_pseudoFullscreen) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-  }
-
-  function _nmv2TagMaximizeButtons() {
-    document.querySelectorAll(
-      'button[aria-label*="最大化"], button[aria-label*="フルスクリーン"], ' +
-      'button[aria-label*="全画面"], [class*="MaximizeButton"], [class*="FullscreenButton"]'
-    ).forEach(btn => {
-      if (btn.dataset.nmv2Disabled) return;
-      btn.dataset.nmv2Disabled = '1';
-      btn.addEventListener('click', _nmv2StopMaximizeClick, true);
-    });
-  }
-
-  function disableNicoMaximizeButton() {
-    _nmv2TagMaximizeButtons();
-    if (_maxBtnObserver) return;
-    _maxBtnObserver = new MutationObserver(_nmv2TagMaximizeButtons);
-    _maxBtnObserver.observe(document.body, { childList: true, subtree: true });
-  }
-
-  function enableNicoMaximizeButton() {
-    if (_maxBtnObserver) { _maxBtnObserver.disconnect(); _maxBtnObserver = null; }
-    // click ハンドラは残置しても _pseudoFullscreen フラグで内部判定するので無害。
-  }
+  // FC2 にはニコ生のような「最大化ボタンを抑え込むネイティブ機能」が無いため no-op。
+  function disableNicoMaximizeButton() { /* no-op (FC2) */ }
+  function enableNicoMaximizeButton()  { /* no-op (FC2) */ }
 
   function setupMaximizeConstraint() {
-    // watchPage の data-player-layout-mode 変化を検知して
-    // _nmv2Fullscreen フラグとキャンバス位置を更新する
-    const watchWatchPage = (wp) => {
-      const update = () => {
-        const state = wp.getAttribute('data-player-layout-mode') === 'full';
-        if (_nmv2Fullscreen === state) return;
-        _nmv2Fullscreen = state;
-        _placeCanvasEls();
-        repositionMainCanvas();
-      };
-      update();
-      new MutationObserver(update).observe(wp, {
-        attributes: true, attributeFilter: ['data-player-layout-mode'],
-      });
-    };
-    const tryFind = () => {
-      const wp = document.getElementById('watchPage')
-              || document.querySelector('[data-player-layout-mode]');
-      if (wp) { watchWatchPage(wp); return true; }
-      return false;
-    };
-    if (!tryFind()) {
-      const obs = new MutationObserver((_, o) => { if (tryFind()) o.disconnect(); });
-      obs.observe(document.documentElement, { childList: true, subtree: true });
-    }
-
-    // ブラウザ Fullscreen API: バーを fullscreen 要素内に移動
+    // FC2 にはニコ生の data-player-layout-mode のような最大化属性は無いため監視不要。
+    // ブラウザ Fullscreen API: バーを fullscreen 要素内に移動するロジックだけ残す。
     document.addEventListener('fullscreenchange', () => {
       // pseudo-fs 中は、ネイティブ Fullscreen と重畳しないようキャンセルする。
-      // （pseudo-fs 起動中にユーザーが F11 等を押した場合の保険）
       if (_pseudoFullscreen && document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
         return;
@@ -1794,51 +1477,37 @@
     location.href = targetUrl;
   }
 
-  // ─── スロットメタ情報（放送者名・サムネ・タイトル）─────────
+  // ─── スロットメタ情報（放送者名・タイトル）─────────────────
+  // FC2 ライブには #embedded-data のような構造化メタデータが無いため、
+  // document.title ("<タイトル> [<FC2USER...>] - FC2ライブ") と h2.c-pgTit から抽出する。
+  // アイコン (thumb) は初期実装では非対応。
   function extractSlotMeta(doc) {
     if (!doc) return null;
     try {
-      const el = doc.getElementById('embedded-data');
-      if (!el) return null;
-      const data = JSON.parse(el.dataset.props ?? 'null');
-      if (!data) return null;
+      const rawTitle = (doc.title || '').trim();
+      if (!rawTitle) return null;
 
-      const program = data.program ?? {};
-      const title   = program.title ?? '';
-      const sp      = program.supplier    ?? {};
-      const bc      = program.broadcaster ?? {};
-      const sg      = data.socialGroup    ?? {};
-      const us      = data.user           ?? {};
+      // "タイトル [FC2USER...] - FC2ライブ" 形式
+      const m = rawTitle.match(/^(.+?)\s+\[(FC2USER[A-Z0-9]+)\]\s+-\s+FC2ライブ\s*$/);
+      let title  = '';
+      let userId = '';
+      if (m) {
+        title  = m[1].trim();
+        userId = m[2];
+      } else {
+        // フォールバック: " - FC2ライブ" を除去するだけ
+        title = rawTitle.replace(/\s+-\s+FC2ライブ\s*$/, '').trim();
+      }
 
-      const name = sp.name || bc.name || sg.name || us.nickname || us.name || '';
+      // 補助: h2.c-pgTit が "未記入" 以外ならそれを優先
+      const pgTit = doc.querySelector?.('h2.c-pgTit')?.textContent?.trim();
+      if (pgTit && pgTit !== '未記入') title = pgTit;
 
-      const thumb =
-        sp.icons?.uri50x50  ||
-        sp.icons?.uri150x150 ||
-        bc.iconUrl          ||
-        sg.thumbnailUrl     ||
-        doc.querySelector('a.user-thumbnail img')?.src ||
-        '';
+      const name = userId || title || '配信者';
 
-      const userId =
-        sp.programProviderId  ||
-        bc.programProviderId  ||
-        us.id                 ||
-        null;
-
-      if (!name && !title) return null;
-      return { title, name, thumb, userId };
+      if (!title && !userId) return null;
+      return { title: title || '無題', name, thumb: '', userId };
     } catch (_) { return null; }
-  }
-
-  function _applyIconClick(img, userId) {
-    if (!userId) return;
-    img.style.cursor = 'pointer';
-    img.style.pointerEvents = 'auto';
-    img.addEventListener('click', e => {
-      e.stopPropagation();
-      window.open(`https://www.nicovideo.jp/user/${userId}`, '_blank', 'noopener');
-    });
   }
 
   function updateSlotLabel(url) {
@@ -1848,21 +1517,13 @@
     if (!slot) return;
     const d = subData.get(url);
     if (!d?.meta) return;
-    const { title, name, thumb, userId } = d.meta;
+    const { title, name } = d.meta;
     if (title) slot.title = title;
     const label = slot.querySelector('.nmv2-label');
     if (!label) return;
     label.innerHTML = '';
-    if (thumb) {
-      const img = document.createElement('img');
-      img.src = thumb;
-      img.style.cssText = 'width:20px;height:20px;border-radius:50%;object-fit:cover;flex-shrink:0;';
-      img.onerror = () => { img.style.display = 'none'; };
-      _applyIconClick(img, userId);
-      label.appendChild(img);
-    }
     const nameEl = document.createElement('span');
-    nameEl.textContent = name || url.match(/lv\d+/)?.[0] || url;
+    nameEl.textContent = name || _extractFc2Id(url) || url;
     nameEl.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;';
     label.appendChild(nameEl);
   }
@@ -1879,7 +1540,7 @@
     if (tryExtract()) return;
     if (!d.iframe) return;
 
-    // MutationObserver で #embedded-data の出現を即時検知（旧 setTimeout 多段ポーリングを置換）
+    // MutationObserver で document.title の確定を待つ（FC2 は load 時点でほぼセット済み）
     const setupMetaObserver = () => {
       try {
         const doc = d.iframe?.contentDocument;
@@ -1944,7 +1605,7 @@
     slot.dataset.idx = String(idx);
     slot.dataset.url = url;
     const _meta = subData.get(url)?.meta;
-    slot.title = _meta?.title || url.match(/lv\d+/)?.[0] || url;
+    slot.title = _meta?.title || _extractFc2Id(url) || url;
     slot.style.cssText = `
       position:relative;width:${SLOT_W}px;height:${SLOT_H}px;
       flex:0 0 auto;background:#000;cursor:pointer;
@@ -1968,7 +1629,7 @@
     ctx.fillStyle = '#666';
     ctx.font = '14px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(url.match(/lv\d+/)?.[0] ?? '...', SLOT_W / 2, SLOT_H / 2);
+    ctx.fillText(_extractFc2Id(url) ?? '...', SLOT_W / 2, SLOT_H / 2);
 
     const d = subData.get(url);
     if (d) {
@@ -1986,24 +1647,11 @@
       pointer-events:none;user-select:none;
       display:flex;align-items:center;gap:5px;overflow:hidden;
     `;
-    if (_meta) {
-      if (_meta.thumb) {
-        const img = document.createElement('img');
-        img.src = _meta.thumb;
-        img.style.cssText = 'width:20px;height:20px;border-radius:50%;object-fit:cover;flex-shrink:0;';
-        img.onerror = () => { img.style.display = 'none'; };
-        _applyIconClick(img, _meta.userId);
-        label.appendChild(img);
-      }
+    {
       const nameEl = document.createElement('span');
-      nameEl.textContent = _meta.name || url.match(/lv\d+/)?.[0] || url;
+      nameEl.textContent = _meta?.name || _extractFc2Id(url) || url;
       nameEl.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;';
       label.appendChild(nameEl);
-    } else {
-      const initSpan = document.createElement('span');
-      initSpan.textContent = url.match(/lv\d+/)?.[0] ?? url;
-      initSpan.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;';
-      label.appendChild(initSpan);
     }
     slot.appendChild(label);
 
@@ -2272,15 +1920,7 @@
       _placeCanvasEls();
       repositionMainCanvas();
     }
-    // 独自最大化ボタン: live 表示時は再挿入、sub 表示時は退避
-    if (_pseudoFullscreen) {
-      if (mainSrc === 'live') {
-        setTimeout(insertCustomMaxBtn, 100);
-      } else {
-        if (customMaxBtn && customMaxBtn.isConnected) customMaxBtn.remove();
-        if (_ctrlBtnObserver) { _ctrlBtnObserver.disconnect(); _ctrlBtnObserver = null; }
-      }
-    }
+    // 独自最大化ボタンは FC2 では未実装（no-op）。スワップ後の状態管理だけ。
     persistState();
   }
 
@@ -2329,7 +1969,7 @@
     ].map(p => p + '!important').join(';') + ';';
 
     const card = document.createElement('div');
-    // カードは pointer-events:auto にして下のニコ生 UI を遮断する
+    // カードは pointer-events:auto にして下のページ UI を遮断する
     card.style.cssText = [
       'background:rgba(20,20,20,0.96)',
       'border:1px solid #5af',
@@ -2343,7 +1983,7 @@
     ].map(p => p + '!important').join(';') + ';';
 
     const title = document.createElement('div');
-    title.textContent = 'NicoMultiViewer の使い方';
+    title.textContent = 'FC2MultiViewer の使い方';
     title.style.cssText = 'font-size:20px;font-weight:bold;margin-bottom:16px;color:#5af;';
 
     const step1 = document.createElement('div');
@@ -2441,24 +2081,23 @@
         const got = await chrome.storage.session.get(stateKey);
         const st  = got[stateKey];
         if (st && Array.isArray(st.subs)) {
-          subUrls = st.subs.filter(isNicoLiveUrl).slice(0, MAX_SUBS);
+          subUrls = st.subs.filter(isFc2LiveUrl).slice(0, MAX_SUBS);
         }
       } catch (_) {}
     }
 
     // 「この放送をメインにする」ボタンによる遷移データを確認（30 秒以内）
-    // URL の完全一致ではなく lv番号で照合する（live ↔ live2 サブドメイン差分を吸収）。
-    const _extractLvId = (s) => (typeof s === 'string' ? s.match(/\blv\d+/)?.[0] : null);
+    // URL の完全一致ではなく FC2 ID（数字）で照合する。
     try {
       const got = await chrome.storage.local.get('nmv2_transfer');
       const tr  = got['nmv2_transfer'];
-      const trLv = _extractLvId(tr?.to);
-      if (tr && trLv && trLv === _extractLvId(liveUrl) && Array.isArray(tr.subs) && Date.now() - tr.ts < 30000) {
-        subUrls = tr.subs.filter(isNicoLiveUrl).slice(0, MAX_SUBS);
+      const trId = _extractFc2Id(tr?.to);
+      if (tr && trId && trId === _extractFc2Id(liveUrl) && Array.isArray(tr.subs) && Date.now() - tr.ts < 30000) {
+        subUrls = tr.subs.filter(isFc2LiveUrl).slice(0, MAX_SUBS);
         // 音量を復元（各放送ごとの独立音量を引き継ぐ）
         if (tr.volumes && typeof tr.volumes === 'object') {
           for (const [u, v] of Object.entries(tr.volumes)) {
-            if (typeof v === 'number' && v >= 0 && v <= 1 && isNicoLiveUrl(u)) {
+            if (typeof v === 'number' && v >= 0 && v <= 1 && isFc2LiveUrl(u)) {
               urlVolumes.set(u, v);
             }
           }
@@ -2507,11 +2146,10 @@
     // frame-content.js → background 中継 → ここで受け取る放送終了通知
     chrome.runtime.onMessage.addListener((msg) => {
       if (msg?.type !== 'nmv2-sub-ended') return;
-      const _lvId = (s) => typeof s === 'string' ? s.match(/\blv\d+/)?.[0] : null;
-      const endedLv = _lvId(msg.url);
-      if (!endedLv) return;
+      const endedId = _extractFc2Id(msg.url);
+      if (!endedId) return;
       for (const url of subUrls) {
-        if (_lvId(url) === endedLv) {
+        if (_extractFc2Id(url) === endedId) {
           markSubEnded(url);
           break;
         }

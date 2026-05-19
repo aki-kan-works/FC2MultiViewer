@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "NicoMultiViewer",
+  "name": "FC2MultiViewer",
   "version": "0.1.0",
-  "description": "ニコニコ生放送を同一タブ内で複数同時視聴したい",
+  "description": "FC2ライブを同一タブ内で複数同時視聴したい",
   "permissions": ["storage", "declarativeNetRequest", "tabs"],
-  "host_permissions": ["https://*.nicovideo.jp/*"],
+  "host_permissions": ["https://*.fc2.com/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -14,16 +14,14 @@
   "content_scripts": [
     {
       "matches": [
-        "https://live.nicovideo.jp/watch/*",
-        "https://live2.nicovideo.jp/watch/*"
+        "https://live.fc2.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
     },
     {
       "matches": [
-        "https://live.nicovideo.jp/watch/*",
-        "https://live2.nicovideo.jp/watch/*"
+        "https://live.fc2.com/*"
       ],
       "js": ["frame-content.js"],
       "all_frames": true,
@@ -34,7 +32,7 @@
   "web_accessible_resources": [
     {
       "resources": ["frame-patch.js"],
-      "matches": ["https://*.nicovideo.jp/*"]
+      "matches": ["https://*.fc2.com/*"]
     }
   ],
   "declarative_net_request": {
